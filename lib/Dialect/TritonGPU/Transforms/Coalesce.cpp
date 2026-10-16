@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iterator>
 #include <numeric>
 
@@ -10,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "tritongpu-coalesce"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -23,6 +25,32 @@ namespace gpu {
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
+  bool verifySlices = false;
+  unsigned verifiedSlices = 0;
+  static SetVector<Operation *> getDependentOps(Operation *root) {
+    SetVector<Operation *> slice;
+    slice.insert(root);
+    // Coalesce needs membership, not topological order. Expand each operation's
+    // direct slice edges once instead of recomputing transitive slices.
+    for (unsigned i = 0; i < slice.size(); ++i) {
+      Operation *op = slice[i];
+      if (!op->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+        for (Value operand : op->getOperands()) {
+          Operation *def = operand.getDefiningOp();
+          if (def && !def->hasTrait<OpTrait::IsIsolatedFromAbove>())
+            slice.insert(def);
+        }
+      }
+      for (Value result : op->getResults())
+        slice.insert(result.getUsers().begin(), result.getUsers().end());
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block)
+            slice.insert(&nested);
+    }
+    return slice;
+  }
+
   void
   setCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
                        int numWarps, int threadsPerWarp,
@@ -51,7 +79,17 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     llvm::SmallSetVector<Operation *, 32> memAccessesSameOrder;
     memAccessesSameOrder.insert(op);
     if (ptr.getDefiningOp()) {
-      for (Operation *use : mlir::multiRootGetSlice(op)) {
+      auto dependentOps = getDependentOps(op);
+      if (verifySlices) {
+        auto original = mlir::multiRootGetSlice(op);
+        if (original.size() != dependentOps.size() ||
+            llvm::any_of(original, [&](Operation *member) {
+              return !dependentOps.contains(member);
+            }))
+          llvm::report_fatal_error("Coalesce slice membership mismatch");
+        ++verifiedSlices;
+      }
+      for (Operation *use : dependentOps) {
         Value val = getMemAccessPtr(use);
         if (!val || !matchesShape(val) || memAccessesSameOrder.contains(use))
           continue;
@@ -154,6 +192,8 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   }
 
   void runOnOperation() override {
+    verifySlices = std::getenv("TRITON_VERIFY_COALESCE_SLICE") != nullptr;
+    verifiedSlices = 0;
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
@@ -176,6 +216,8 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
       setCoalescedEncoding(axisInfoAnalysis, curr, numWarps, threadsPerWarp,
                            layoutMap);
     });
+    if (verifySlices)
+      llvm::errs() << "Coalesce verified slices: " << verifiedSlices << "\n";
 
     // For each memory op that has a layout L1:
     // 1. Create a coalesced memory layout L2 of the pointer operands
